@@ -52,6 +52,28 @@ The ntfy topic is generated randomly; treat it like a password. For stronger pri
 | `lan-watch voice [--test unknown]` | speak every alert out loud (desktop session) |
 | `lan-watch dashboard [--fps N]` | animated full-screen live view of devices and recent events |
 
+## Managing known devices
+
+`/etc/lan-watch/devices.toml` is the allow-list: any MAC not listed there is "unknown" and triggers an alert. It is re-read on every scan, so no restart is needed (the dashboard picks changes up within seconds). Keep your real file out of public repositories; a good pattern is a private repo as the source of truth plus a small deploy script that copies it to the host.
+
+**Add a device**
+
+1. Connect it to the network (the "unknown device" alert is expected) and find its MAC with `sudo -u lanwatch lan-watch list` (shown as `** UNLABELED **`) or in your router's app.
+2. Append a block to `devices.toml`:
+   ```toml
+   [[device]]
+   mac = "aa:bb:cc:dd:ee:ff"
+   alias = "guest-laptop"     # lowercase, no spaces
+   kind = "laptop"            # free text: phone, laptop, camera, tv, printer...
+   ```
+3. Check: `sudo -u lanwatch lan-watch status` should show `unlabeled: 0`.
+
+**Edit a device**: change `alias` or `kind`. The MAC is the key: a different MAC is a different device.
+
+**Remove a device**: delete its block. It does not alert right away; it alerts the next time it reconnects after being offline (`offline_after_misses` scans without an answer).
+
+**Phones and "private Wi-Fi address"**: use the MAC the phone shows *on this network*, not the hardware MAC in its settings. If the owner turns the feature off or "forgets" the network, the MAC changes and the phone shows up as unknown again.
+
 ## Voice alerts
 
 `lan-watch voice` runs inside the desktop session (as a systemd user service, see `systemd/lan-watch-voice.service`), watches the event log and plays a voice clip for every alert: "a new, unknown device has just connected to your network" or "two devices are claiming the same address". The clips in `sounds/` were made offline with Piper and a public-domain voice; replace them with any WAV you like. Set `[sound].quiet_hours = "23:00-07:00"` to keep the house quiet at night (push notifications still arrive). Try it with `lan-watch voice --test unknown`.
