@@ -58,7 +58,7 @@ The ntfy topic is generated randomly; treat it like a password. For stronger pri
 
 ## Live dashboard
 
-`lan-watch dashboard` is an animated green-on-black view (4 fps by default, `--fps` to change): a live clock, a countdown bar to the next scan, a radar sweep over the device list with time since each device was last seen, the latest events (fresh ones blink, unknown devices in red) and some digital rain in the free space. It reads the database read-only and costs about 3 % CPU on an Atom N450 (the terminal itself takes ~10 %). To have it open full screen whenever the desktop starts, copy `examples/lan-watch-dashboard.desktop` to `~/.config/autostart/` (Xfce). Keep in mind that anyone who can see that screen sees who is home.
+`lan-watch dashboard` is an animated green-on-black view (4 fps by default, `--fps` to change): a live clock, a countdown bar to the next scan, a radar sweep over the device list with time since each device was last seen, and the event log filling the rest of the screen (fresh events blink, unknown devices in red). It reads the database read-only and costs about 3 % CPU on an Atom N450 (the terminal itself takes ~10 %). To have it open full screen whenever the desktop starts, copy `examples/lan-watch-dashboard.desktop` to `~/.config/autostart/` (Xfce). Keep in mind that anyone who can see that screen sees who is home.
 
 Every event is also written to the journal: `journalctl -u lan-watch.service -f`.
 

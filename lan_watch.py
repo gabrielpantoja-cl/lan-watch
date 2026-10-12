@@ -327,7 +327,7 @@ def _read_state(path):
     conn.row_factory = sqlite3.Row
     try:
         devs = conn.execute("SELECT * FROM devices ORDER BY online DESC, ip").fetchall()
-        evs = conn.execute("SELECT * FROM events ORDER BY ts DESC, id DESC LIMIT 50").fetchall()
+        evs = conn.execute("SELECT * FROM events ORDER BY ts DESC, id DESC LIMIT 200").fetchall()
         return devs, evs, meta_get(conn, "armed", "0") == "1", int(meta_get(conn, "last_scan", "0"))
     finally:
         conn.close()
@@ -353,16 +353,15 @@ def _ago(seconds):
 
 
 def cmd_dashboard(args):
-    """Full-screen animated live view: devices, scan countdown, events and some digital rain."""
-    import random
+    """Full-screen animated live view: devices, scan countdown, and as many recent events as fit."""
     import shutil
     G, BG, R, Y, DIM, B, X, EL = ("\033[32m", "\033[92m", "\033[31m", "\033[33m", "\033[2m", "\033[1m",
                                   "\033[0m", "\033[K")
-    spin, glyphs = "|/-\\", "0123456789abcdef#$%&*+=<>:"
+    spin = "|/-\\"
     path = args.db or f"{STATE_DIR}/state.db"
     host = os.uname().nodename
     scan_span = 50  # timer fires every 60 s, measured from the start of the previous ~10 s scan
-    state, known, loaded, frame, drops = None, {}, 0.0, 0, []
+    state, known, loaded, frame = None, {}, 0.0, 0
     sys.stdout.write("\033[?25l\033[2J")
     try:
         while True:
@@ -418,7 +417,8 @@ def cmd_dashboard(args):
             unknown = sum(1 for d in devs if d["mac"] not in known)
             lines.append(f" {B}EVENTS{X}   {(R + B) if unknown else G}{unknown} unknown{X}   "
                          f"{G}{sum(1 for d in devs if d['online'])}/{len(devs)} online{X}")
-            n_events = max(3, min(args.events, rows - len(lines) - 6))
+            room = rows - len(lines) - 1  # the event log fills the rest of the screen
+            n_events = max(3, min(args.events, room) if args.events else room)
             for e in evs[:n_events]:
                 is_known = e["mac"] in known
                 who = known.get(e["mac"], {}).get("alias") or e["mac"] or e["detail"]
@@ -426,23 +426,6 @@ def cmd_dashboard(args):
                 if now - e["ts"] < 120 and blink:
                     color += B + "\033[7m"
                 lines.append(f" {DIM}{fmt_ts(e['ts'])}{X}  {color}{e['kind']:9}{X}{who[:40]:42}{e['ip'] or ''}")
-
-            rain_h = rows - len(lines) - 1
-            if rain_h > 1:
-                if len(drops) != w:
-                    drops = [random.randint(-rain_h * 4, rain_h) for _ in range(w)]
-                for r in range(rain_h):
-                    cells = []
-                    for c in range(w):
-                        dist = drops[c] - r
-                        if dist == 0:
-                            cells.append(BG + B + random.choice(glyphs) + X)
-                        elif 0 < dist < 7:
-                            cells.append((G if dist < 4 else DIM + G) + random.choice(glyphs) + X)
-                        else:
-                            cells.append(" ")
-                    lines.append(" " + "".join(cells))
-                drops = [p + 1 if p < rain_h + 7 else random.randint(-rain_h * 4, 0) for p in drops]
 
             sys.stdout.write("\033[H" + "".join(line + EL + "\n" for line in lines[:rows - 1]) + "\033[J")
             sys.stdout.flush()
@@ -538,7 +521,7 @@ def main(argv=None):
     d = sub.add_parser("dashboard", help="full-screen live view of devices and events")
     d.add_argument("--fps", type=int, default=4, help="frames per second of the animation")
     d.add_argument("--refresh", type=float, default=2, help="seconds between database reads")
-    d.add_argument("--events", type=int, default=10, help="max recent events to show")
+    d.add_argument("--events", type=int, default=0, help="max recent events to show (0 = fill the screen)")
     d.set_defaults(fn=cmd_dashboard)
     args = p.parse_args(argv)
     return args.fn(args)
