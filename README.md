@@ -49,7 +49,12 @@ The ntfy topic is generated randomly; treat it like a password. For stronger pri
 | `lan-watch status` | one-line summary |
 | `lan-watch arm [--off]` | enable / disable alerts |
 | `lan-watch test-alert` | send a test notification |
+| `lan-watch voice [--test unknown]` | speak every alert out loud (desktop session) |
 | `lan-watch dashboard [--fps N]` | animated full-screen live view of devices and recent events |
+
+## Voice alerts
+
+`lan-watch voice` runs inside the desktop session (as a systemd user service, see `systemd/lan-watch-voice.service`), watches the event log and plays a voice clip for every alert: "a new, unknown device has just connected to your network" or "two devices are claiming the same address". The clips in `sounds/` were made offline with Piper and a public-domain voice; replace them with any WAV you like. Set `[sound].quiet_hours = "23:00-07:00"` to keep the house quiet at night (push notifications still arrive). Try it with `lan-watch voice --test unknown`.
 
 ## Live dashboard
 

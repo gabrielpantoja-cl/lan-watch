@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -92,6 +93,25 @@ class LogicTests(unittest.TestCase):
         seen = [("10.0.0.1", "aa:00:00:00:00:01", ""), ("10.0.0.1", "bb:00:00:00:00:02", "")]
         lw.process_scan(conn, seen, {"aa:00:00:00:00:01": {}, "bb:00:00:00:00:02": {}}, cfg, n, now=1000)
         self.assertTrue(any(s[2] == 5 for s in n.sent))
+
+
+class VoiceTests(unittest.TestCase):
+    def test_alert_event_logged_only_when_armed(self):
+        conn, n, cfg = fresh()
+        lw.process_scan(conn, [("10.0.0.5", "aa:00:00:00:00:01", "")], {}, cfg, n, now=1000)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE kind='alert'").fetchone()[0], 0)
+        lw.meta_set(conn, "armed", 1)
+        lw.process_scan(conn, [("10.0.0.6", "aa:00:00:00:00:02", "")], {}, cfg, n, now=2000)
+        row = conn.execute("SELECT detail FROM events WHERE kind='alert'").fetchone()
+        self.assertEqual(row[0], "unknown")
+
+    def test_quiet_hours_cross_midnight(self):
+        at = lambda h, m: time.struct_time((2026, 1, 1, h, m, 0, 0, 1, -1))
+        self.assertTrue(lw.in_quiet_hours("23:00-07:00", at(2, 30)))
+        self.assertTrue(lw.in_quiet_hours("23:00-07:00", at(23, 0)))
+        self.assertFalse(lw.in_quiet_hours("23:00-07:00", at(12, 0)))
+        self.assertTrue(lw.in_quiet_hours("13:00-14:00", at(13, 30)))
+        self.assertFalse(lw.in_quiet_hours("", at(2, 0)))
 
 
 if __name__ == "__main__":

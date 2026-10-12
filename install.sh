@@ -20,9 +20,13 @@ if [ ! -f /etc/lan-watch/ntfy-topic ]; then
   chown root:lanwatch /etc/lan-watch/ntfy-topic; chmod 0640 /etc/lan-watch/ntfy-topic
 fi
 
+install -d -m 0755 /usr/local/share/lan-watch/sounds
+install -m 0644 "$SRC"/sounds/*.wav /usr/local/share/lan-watch/sounds/
+
 install -m 0644 "$SRC/systemd/lan-watch.service" /etc/systemd/system/lan-watch.service
 install -m 0644 "$SRC/systemd/lan-watch.timer"   /etc/systemd/system/lan-watch.timer
 systemctl daemon-reload
 echo "Installed. Next: edit /etc/lan-watch/config.toml (interface) and devices.toml,"
 echo "subscribe your phone to the topic in /etc/lan-watch/ntfy-topic, then:"
 echo "  systemctl enable --now lan-watch.timer ; sudo -u lanwatch lan-watch list ; sudo -u lanwatch lan-watch arm"
+echo "Optional voice alerts (as the desktop user): see systemd/lan-watch-voice.service"

@@ -1,0 +1,14 @@
+# systemd USER unit: plays alert sounds inside the desktop session (needs its audio server).
+# Install: cp systemd/lan-watch-voice.service ~/.config/systemd/user/
+#          systemctl --user enable --now lan-watch-voice.service
+[Unit]
+Description=lan-watch: speak alerts out loud
+After=pulseaudio.service pipewire-pulse.service
+
+[Service]
+ExecStart=/usr/local/bin/lan-watch voice
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

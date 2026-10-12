@@ -45,6 +45,14 @@ DEFAULTS = {
         "known_online_offline": False,
     },
     "retention": {"events_days": 90},
+    "sound": {
+        # Played by `lan-watch voice`, which runs inside the desktop session (it needs the
+        # session's audio server). Empty path = no sound for that alert.
+        "player": "paplay",
+        "unknown": "/usr/local/share/lan-watch/sounds/unknown.wav",
+        "conflict": "/usr/local/share/lan-watch/sounds/conflict.wav",
+        "quiet_hours": "",  # e.g. "23:00-07:00": stay silent (ntfy still notifies)
+    },
 }
 
 ARP_LINE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})\t([0-9a-fA-F:]{17})\t(.*)$")
@@ -191,9 +199,12 @@ def process_scan(conn, seen, known, cfg, notifier, now=None) -> list[str]:
 
     def alert(kind, mac, ip, title, body, priority, tags):
         row = conn.execute("SELECT last_alert FROM devices WHERE mac=?", (mac,)).fetchone() if mac else None
-        if row and row["last_alert"] and now - row["last_alert"] < det["alert_cooldown_seconds"]:
+        if not armed or (row and row["last_alert"] and now - row["last_alert"] < det["alert_cooldown_seconds"]):
             return
-        if armed and notifier.send(title, body, priority, tags) and mac:
+        log_event(conn, now, "alert", mac, ip, kind)  # `lan-watch voice` speaks these
+        produced.append("alert")
+        notifier.send(title, body, priority, tags)
+        if mac:
             conn.execute("UPDATE devices SET last_alert=? WHERE mac=?", (now, mac))
 
     # Address conflicts: one IP answered by two different MACs (ARP spoofing hint).
@@ -207,6 +218,8 @@ def process_scan(conn, seen, known, cfg, notifier, now=None) -> list[str]:
             produced.append("conflict")
             last = int(meta_get(conn, f"conflict:{ip}", "0"))
             if alerts["address_conflict"] and armed and (last == 0 or now - last >= det["alert_cooldown_seconds"]):
+                log_event(conn, now, "alert", "", ip, "conflict")
+                produced.append("alert")
                 if notifier.send("lan-watch: IP conflict",
                                  f"IP {ip} is being answered by {len(macs)} different devices "
                                  f"({', '.join(short_mac(m) for m in sorted(macs))}). Possible ARP spoofing.",
@@ -409,7 +422,7 @@ def cmd_dashboard(args):
             for e in evs[:n_events]:
                 is_known = e["mac"] in known
                 who = known.get(e["mac"], {}).get("alias") or e["mac"] or e["detail"]
-                color = {"new": G if is_known else R + B, "conflict": R + B, "online": G, "offline": DIM}.get(e["kind"], "")
+                color = {"new": G if is_known else R + B, "conflict": R + B, "alert": R + B, "online": G, "offline": DIM}.get(e["kind"], "")
                 if now - e["ts"] < 120 and blink:
                     color += B + "\033[7m"
                 lines.append(f" {DIM}{fmt_ts(e['ts'])}{X}  {color}{e['kind']:9}{X}{who[:40]:42}{e['ip'] or ''}")
@@ -442,6 +455,55 @@ def cmd_dashboard(args):
         sys.stdout.flush()
 
 
+def in_quiet_hours(spec: str, now: time.struct_time) -> bool:
+    """True if `now` falls inside an "HH:MM-HH:MM" window (which may cross midnight)."""
+    if not spec:
+        return False
+    start, end = ((int(h) * 60 + int(m)) for h, m in (part.split(":") for part in spec.split("-")))
+    minute = now.tm_hour * 60 + now.tm_min
+    return start <= minute < end if start <= end else (minute >= start or minute < end)
+
+
+def cmd_voice(args):
+    """Watch the event log and play a sound for each alert. Run it inside the desktop session."""
+    try:
+        cfg = load_config(args.config)
+    except OSError:  # the config is readable only by root/lanwatch: fall back to defaults
+        cfg = merge(DEFAULTS, {})
+    snd = cfg["sound"]
+
+    def play(kind):
+        path = snd.get(kind) or ""
+        if not os.path.exists(path):
+            print(f"lan-watch voice: no sound for '{kind}' ({path or 'not set'})", file=sys.stderr)
+            return
+        subprocess.run([snd["player"], path], timeout=60, check=False)
+
+    if args.test:
+        play(args.test)
+        return 0
+    db = args.db or f"{STATE_DIR}/state.db"
+    last_id = None
+    while True:
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+            conn.row_factory = sqlite3.Row
+            if last_id is None:  # start from "now": never replay old alerts
+                last_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
+            rows = conn.execute("SELECT id, detail FROM events WHERE kind='alert' AND id>? ORDER BY id",
+                                (last_id,)).fetchall()
+            conn.close()
+        except sqlite3.Error as exc:
+            print(f"lan-watch voice: {exc}", file=sys.stderr)
+            rows = []
+        for row in rows:
+            last_id = row["id"]
+            if in_quiet_hours(snd.get("quiet_hours", ""), time.localtime()):
+                continue
+            play(row["detail"])
+        time.sleep(args.interval)
+
+
 def cmd_arm(args):
     meta_set(open_db(args.db), "armed", "0" if args.off else "1")
     print("alerts disarmed" if args.off else "alerts armed")
@@ -469,6 +531,10 @@ def main(argv=None):
     a.add_argument("--off", action="store_true")
     a.set_defaults(fn=cmd_arm)
     sub.add_parser("test-alert", help="send a test notification").set_defaults(fn=cmd_test_alert)
+    v = sub.add_parser("voice", help="play a sound for every alert (run inside the desktop session)")
+    v.add_argument("--interval", type=float, default=3, help="seconds between checks")
+    v.add_argument("--test", choices=["unknown", "conflict"], help="play one sound and exit")
+    v.set_defaults(fn=cmd_voice)
     d = sub.add_parser("dashboard", help="full-screen live view of devices and events")
     d.add_argument("--fps", type=int, default=4, help="frames per second of the animation")
     d.add_argument("--refresh", type=float, default=2, help="seconds between database reads")
