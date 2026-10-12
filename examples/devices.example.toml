@@ -1,0 +1,12 @@
+# Copy to /etc/lan-watch/devices.toml. Only devices listed here are "known";
+# anything else triggers an alert. Keep your real file out of public repositories.
+
+[[device]]
+mac = "aa:bb:cc:dd:ee:01"
+alias = "living-room-tv"
+kind = "tv"
+
+[[device]]
+mac = "aa:bb:cc:dd:ee:02"
+alias = "my-phone"
+kind = "phone"   # phones with a "private Wi-Fi address" use one MAC per network

@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""lan-watch: detect unknown devices on your LAN with arp-scan and alert through ntfy.
+
+Standard library only (Python >= 3.11). Meant to run every minute from a systemd
+timer as an unprivileged user holding CAP_NET_RAW. State lives in SQLite.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.request
+
+CONFIG_DIR = os.environ.get("LAN_WATCH_CONFIG_DIR", "/etc/lan-watch")
+STATE_DIR = os.environ.get("LAN_WATCH_STATE_DIR", "/var/lib/lan-watch")
+
+DEFAULTS = {
+    "scan": {
+        "interface": "eth0",
+        "retries": 3,
+        "ouifile": "/usr/share/arp-scan/ieee-oui.txt",
+        "arp_scan": "/usr/sbin/arp-scan",
+    },
+    "detect": {
+        # Scans without an answer before a device is considered offline. Phones and
+        # cameras sleep and miss ARP requests, so one miss must never mean "gone".
+        "offline_after_misses": 10,
+        # Minimum seconds between two alerts about the same MAC.
+        "alert_cooldown_seconds": 6 * 3600,
+    },
+    "ntfy": {
+        "server": "https://ntfy.sh",
+        "topic_file": f"{CONFIG_DIR}/ntfy-topic",
+    },
+    "alerts": {
+        "unknown_device": True,
+        "address_conflict": True,
+        # Presence of known people is sensitive information: off by default.
+        "known_online_offline": False,
+    },
+    "retention": {"events_days": 90},
+}
+
+ARP_LINE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})\t([0-9a-fA-F:]{17})\t(.*)$")
+
+
+def merge(base: dict, extra: dict) -> dict:
+    out = {k: (dict(v) if isinstance(v, dict) else v) for k, v in base.items()}
+    for key, val in extra.items():
+        if isinstance(val, dict) and isinstance(out.get(key), dict):
+            out[key] = merge(out[key], val)
+        else:
+            out[key] = val
+    return out
+
+
+def load_config(path: str | None = None) -> dict:
+    path = path or f"{CONFIG_DIR}/config.toml"
+    if not os.path.exists(path):
+        return merge(DEFAULTS, {})
+    with open(path, "rb") as fh:
+        return merge(DEFAULTS, tomllib.load(fh))
+
+
+def normalize_mac(mac: str) -> str:
+    return mac.strip().lower().replace("-", ":")
+
+
+def load_devices(path: str | None = None) -> dict[str, dict]:
+    """Known devices: {mac: {"alias": ..., "kind": ...}} from devices.toml."""
+    path = path or f"{CONFIG_DIR}/devices.toml"
+    if not os.path.exists(path):
+        return {}
+    with open(path, "rb") as fh:
+        data = tomllib.load(fh)
+    return {normalize_mac(d["mac"]): d for d in data.get("device", []) if "mac" in d}
+
+
+def is_random_mac(mac: str) -> bool:
+    """Locally administered bit set: typical of 'private Wi-Fi address' phones."""
+    return bool(int(mac.split(":")[0], 16) & 0b10)
+
+
+def parse_arp_scan(text: str) -> list[tuple[str, str, str]]:
+    """Return unique (ip, mac, vendor) tuples from arp-scan output."""
+    seen: dict[tuple[str, str], str] = {}
+    for line in text.splitlines():
+        m = ARP_LINE.match(line)
+        if not m:
+            continue
+        ip, mac, vendor = m.group(1), normalize_mac(m.group(2)), m.group(3).strip()
+        vendor = re.sub(r"\s*\(DUP: \d+\)$", "", vendor)
+        if vendor.startswith("(Unknown"):
+            vendor = ""
+        seen.setdefault((ip, mac), vendor)
+    return [(ip, mac, vendor) for (ip, mac), vendor in seen.items()]
+
+
+def run_arp_scan(cfg: dict) -> list[tuple[str, str, str]]:
+    s = cfg["scan"]
+    cmd = [s["arp_scan"], f"--interface={s['interface']}", "--localnet",
+           f"--retry={s['retries']}", f"--ouifile={s['ouifile']}"]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+    if res.returncode != 0:
+        raise RuntimeError(f"arp-scan failed ({res.returncode}): {res.stderr.strip()[:300]}")
+    return parse_arp_scan(res.stdout)
+
+
+# --- state ---------------------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS devices (
+  mac TEXT PRIMARY KEY, ip TEXT, vendor TEXT, first_seen INTEGER, last_seen INTEGER,
+  misses INTEGER DEFAULT 0, online INTEGER DEFAULT 1, last_alert INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY, ts INTEGER, kind TEXT, mac TEXT, ip TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+def open_db(path: str | None = None) -> sqlite3.Connection:
+    path = path or f"{STATE_DIR}/state.db"
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def meta_get(conn, key, default=None):
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def meta_set(conn, key, value):
+    conn.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (key, str(value)))
+    conn.commit()
+
+
+def log_event(conn, ts, kind, mac="", ip="", detail=""):
+    conn.execute("INSERT INTO events(ts,kind,mac,ip,detail) VALUES(?,?,?,?,?)", (ts, kind, mac, ip, detail))
+
+
+# --- notifications -------------------------------------------------------------
+
+class Notifier:
+    def __init__(self, cfg: dict, dry_run: bool = False):
+        self.server = cfg["ntfy"]["server"].rstrip("/")
+        self.topic_file = cfg["ntfy"]["topic_file"]
+        self.dry_run = dry_run
+
+    def send(self, title: str, body: str, priority: int = 3, tags: str = "") -> bool:
+        if self.dry_run:
+            print(f"[dry-run] ({priority}) {title} | {body}")
+            return True
+        try:
+            topic = open(self.topic_file).read().strip()
+            req = urllib.request.Request(
+                f"{self.server}/{topic}", data=body.encode("utf-8"), method="POST",
+                headers={"Title": title, "Priority": str(priority), "Tags": tags})
+            with urllib.request.urlopen(req, timeout=15):
+                return True
+        except (OSError, urllib.error.URLError) as exc:
+            print(f"lan-watch: could not send notification: {exc}", file=sys.stderr)
+            return False
+
+
+def short_mac(mac: str) -> str:
+    return "..:" + ":".join(mac.split(":")[-3:])
+
+
+# --- core logic ----------------------------------------------------------------
+
+def process_scan(conn, seen, known, cfg, notifier, now=None) -> list[str]:
+    """Apply one scan result to the state. Returns the list of event kinds produced."""
+    now = int(now if now is not None else time.time())
+    armed = meta_get(conn, "armed", "0") == "1"
+    det, alerts = cfg["detect"], cfg["alerts"]
+    produced: list[str] = []
+
+    def alert(kind, mac, ip, title, body, priority, tags):
+        row = conn.execute("SELECT last_alert FROM devices WHERE mac=?", (mac,)).fetchone() if mac else None
+        if row and row["last_alert"] and now - row["last_alert"] < det["alert_cooldown_seconds"]:
+            return
+        if armed and notifier.send(title, body, priority, tags) and mac:
+            conn.execute("UPDATE devices SET last_alert=? WHERE mac=?", (now, mac))
+
+    # Address conflicts: one IP answered by two different MACs (ARP spoofing hint).
+    by_ip: dict[str, set[str]] = {}
+    for ip, mac, _ in seen:
+        by_ip.setdefault(ip, set()).add(mac)
+    for ip, macs in by_ip.items():
+        if len(macs) > 1:
+            detail = ",".join(sorted(macs))
+            log_event(conn, now, "conflict", "", ip, detail)
+            produced.append("conflict")
+            last = int(meta_get(conn, f"conflict:{ip}", "0"))
+            if alerts["address_conflict"] and armed and (last == 0 or now - last >= det["alert_cooldown_seconds"]):
+                if notifier.send("lan-watch: IP conflict",
+                                 f"IP {ip} is being answered by {len(macs)} different devices "
+                                 f"({', '.join(short_mac(m) for m in sorted(macs))}). Possible ARP spoofing.",
+                                 5, "rotating_light"):
+                    meta_set(conn, f"conflict:{ip}", now)
+
+    seen_macs = set()
+    for ip, mac, vendor in seen:
+        seen_macs.add(mac)
+        row = conn.execute("SELECT * FROM devices WHERE mac=?", (mac,)).fetchone()
+        is_new = row is None
+        came_online = (row is not None and not row["online"])
+        if is_new:
+            conn.execute("INSERT INTO devices(mac,ip,vendor,first_seen,last_seen,misses,online) VALUES(?,?,?,?,?,0,1)",
+                         (mac, ip, vendor, now, now))
+            log_event(conn, now, "new", mac, ip, vendor)
+            produced.append("new")
+        else:
+            conn.execute("UPDATE devices SET ip=?, vendor=COALESCE(NULLIF(?,''),vendor), last_seen=?, misses=0, online=1 WHERE mac=?",
+                         (ip, vendor, now, mac))
+            if came_online:
+                log_event(conn, now, "online", mac, ip, "")
+                produced.append("online")
+        if mac in known:
+            if came_online and alerts["known_online_offline"]:
+                alert("online", mac, ip, "lan-watch: device online", f"{known[mac].get('alias', 'known device')} is online.", 2, "")
+        elif (is_new or came_online) and alerts["unknown_device"]:
+            hint = " Random MAC (probably a phone)." if is_random_mac(mac) else ""
+            alert("unknown", mac, ip, "lan-watch: unknown device on the network",
+                  f"Vendor: {vendor or 'unknown'}. IP: {ip}. MAC: {short_mac(mac)}.{hint}", 4, "warning")
+
+    # Misses only count if the scan answered at all (otherwise the interface is down).
+    if seen:
+        for row in conn.execute("SELECT * FROM devices WHERE online=1").fetchall():
+            if row["mac"] in seen_macs:
+                continue
+            misses = row["misses"] + 1
+            if misses >= det["offline_after_misses"]:
+                conn.execute("UPDATE devices SET misses=?, online=0 WHERE mac=?", (misses, row["mac"]))
+                log_event(conn, now, "offline", row["mac"], row["ip"], "")
+                produced.append("offline")
+                if row["mac"] in known and alerts["known_online_offline"]:
+                    alert("offline", row["mac"], row["ip"], "lan-watch: device offline",
+                          f"{known[row['mac']].get('alias', 'known device')} went offline.", 2, "")
+            else:
+                conn.execute("UPDATE devices SET misses=? WHERE mac=?", (misses, row["mac"]))
+    conn.commit()
+    return produced
+
+
+def prune(conn, cfg, now=None):
+    now = int(now if now is not None else time.time())
+    cutoff = now - cfg["retention"]["events_days"] * 86400
+    conn.execute("DELETE FROM events WHERE ts<?", (cutoff,))
+    conn.execute("DELETE FROM devices WHERE last_seen<?", (cutoff,))
+    conn.commit()
+
+
+# --- CLI -----------------------------------------------------------------------
+
+def cmd_scan(args):
+    cfg, known = load_config(args.config), load_devices(args.devices)
+    conn = open_db(args.db)
+    try:
+        seen = run_arp_scan(cfg)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        print(f"lan-watch: {exc}", file=sys.stderr)
+        return 1
+    process_scan(conn, seen, known, cfg, Notifier(cfg, dry_run=args.dry_run))
+    prune(conn, cfg)
+    return 0
+
+
+def fmt_ts(ts):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "-"
+
+
+def cmd_list(args):
+    known, conn = load_devices(args.devices), open_db(args.db)
+    rows = conn.execute("SELECT * FROM devices ORDER BY online DESC, ip").fetchall()
+    print(f"{'MAC':17}  {'IP':15}  {'STATE':7}  {'ALIAS':18}  {'LAST SEEN':16}  VENDOR")
+    for r in rows:
+        alias = known.get(r["mac"], {}).get("alias", "** UNLABELED **")
+        print(f"{r['mac']:17}  {r['ip'] or '-':15}  {'online' if r['online'] else 'offline':7}  "
+              f"{alias:18}  {fmt_ts(r['last_seen']):16}  {r['vendor'] or '-'}"
+              f"{'  [random MAC]' if is_random_mac(r['mac']) else ''}")
+    return 0
+
+
+def cmd_status(args):
+    conn, known = open_db(args.db), load_devices(args.devices)
+    total = conn.execute("SELECT COUNT(*) c FROM devices").fetchone()["c"]
+    online = conn.execute("SELECT COUNT(*) c FROM devices WHERE online=1").fetchone()["c"]
+    unl = sum(1 for r in conn.execute("SELECT mac FROM devices") if r["mac"] not in known)
+    print(f"armed: {meta_get(conn, 'armed', '0') == '1'} | devices: {total} | online: {online} | unlabeled: {unl}")
+    return 0
+
+
+def cmd_arm(args):
+    meta_set(open_db(args.db), "armed", "0" if args.off else "1")
+    print("alerts disarmed" if args.off else "alerts armed")
+    return 0
+
+
+def cmd_test_alert(args):
+    cfg = load_config(args.config)
+    ok = Notifier(cfg).send("lan-watch: test", "If you can read this, alerts work.", 3, "white_check_mark")
+    print("sent" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="lan-watch", description=__doc__.splitlines()[0])
+    for opt in ("--config", "--devices", "--db"):
+        p.add_argument(opt)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("scan", help="run one scan and process it")
+    s.add_argument("--dry-run", action="store_true", help="print alerts instead of sending them")
+    s.set_defaults(fn=cmd_scan)
+    sub.add_parser("list", help="show every device seen, flagging unlabeled ones").set_defaults(fn=cmd_list)
+    sub.add_parser("status", help="short summary").set_defaults(fn=cmd_status)
+    a = sub.add_parser("arm", help="enable alerts (before that, scans only record)")
+    a.add_argument("--off", action="store_true")
+    a.set_defaults(fn=cmd_arm)
+    sub.add_parser("test-alert", help="send a test notification").set_defaults(fn=cmd_test_alert)
+    args = p.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

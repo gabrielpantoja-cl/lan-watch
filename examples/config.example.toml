@@ -1,0 +1,17 @@
+# Copy to /etc/lan-watch/config.toml. Every key is optional (defaults in lan_watch.py).
+
+[scan]
+interface = "eth0"          # the interface connected to the LAN you want to watch
+
+[detect]
+offline_after_misses = 10   # scans without answer before a device counts as offline
+alert_cooldown_seconds = 21600
+
+[ntfy]
+server = "https://ntfy.sh"  # or your own self-hosted ntfy
+topic_file = "/etc/lan-watch/ntfy-topic"
+
+[alerts]
+unknown_device = true
+address_conflict = true
+known_online_offline = false   # presence of people is sensitive: keep off unless you want it

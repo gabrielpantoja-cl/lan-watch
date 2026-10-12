@@ -1,0 +1,28 @@
+[Unit]
+Description=lan-watch: scan the LAN and alert on unknown devices
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=lanwatch
+Group=lanwatch
+ExecStart=/usr/local/bin/lan-watch scan
+StateDirectory=lan-watch
+ConfigurationDirectory=lan-watch
+# arp-scan needs raw sockets; grant just that, to this unit only.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_PACKET AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
