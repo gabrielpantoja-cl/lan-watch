@@ -49,11 +49,11 @@ The ntfy topic is generated randomly; treat it like a password. For stronger pri
 | `lan-watch status` | one-line summary |
 | `lan-watch arm [--off]` | enable / disable alerts |
 | `lan-watch test-alert` | send a test notification |
-| `lan-watch dashboard [--refresh N]` | full-screen live view of devices and recent events |
+| `lan-watch dashboard [--fps N]` | animated full-screen live view of devices and recent events |
 
 ## Live dashboard
 
-`lan-watch dashboard` redraws a green-on-black view every few seconds: every device with its state, alias, IP and MAC, plus the latest events (new, online, offline, conflict). Unknown devices show in red. To have it open full screen whenever the desktop starts, copy `examples/lan-watch-dashboard.desktop` to `~/.config/autostart/` (Xfce). Keep in mind that anyone who can see that screen sees who is home.
+`lan-watch dashboard` is an animated green-on-black view (4 fps by default, `--fps` to change): a live clock, a countdown bar to the next scan, a radar sweep over the device list with time since each device was last seen, the latest events (fresh ones blink, unknown devices in red) and some digital rain in the free space. It reads the database read-only and costs about 3 % CPU on an Atom N450 (the terminal itself takes ~10 %). To have it open full screen whenever the desktop starts, copy `examples/lan-watch-dashboard.desktop` to `~/.config/autostart/` (Xfce). Keep in mind that anyone who can see that screen sees who is home.
 
 Every event is also written to the journal: `journalctl -u lan-watch.service -f`.
 

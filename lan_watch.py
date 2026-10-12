@@ -309,46 +309,137 @@ def cmd_status(args):
     return 0
 
 
+def _read_state(path):
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        devs = conn.execute("SELECT * FROM devices ORDER BY online DESC, ip").fetchall()
+        evs = conn.execute("SELECT * FROM events ORDER BY ts DESC, id DESC LIMIT 50").fetchall()
+        return devs, evs, meta_get(conn, "armed", "0") == "1", int(meta_get(conn, "last_scan", "0"))
+    finally:
+        conn.close()
+
+
+def _sysinfo():
+    mem = {}
+    with open("/proc/meminfo") as fh:
+        for line in fh:
+            key, val = line.split(":", 1)
+            if key in ("MemTotal", "MemAvailable"):
+                mem[key] = int(val.split()[0]) // 1024
+    with open("/proc/uptime") as fh:
+        up = int(float(fh.read().split()[0]))
+    return os.getloadavg()[0], mem, up
+
+
+def _ago(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 120:
+        return f"{seconds}s"
+    return f"{seconds // 60}m" if seconds < 7200 else f"{seconds // 3600}h"
+
+
 def cmd_dashboard(args):
-    """Full-screen live view: devices and latest events, refreshed every few seconds."""
-    G, R, Y, DIM, B, X = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[1m", "\033[0m"
-    colors = {"new": R + B, "conflict": R + B, "online": G, "offline": DIM}
+    """Full-screen animated live view: devices, scan countdown, events and some digital rain."""
+    import random
+    import shutil
+    G, BG, R, Y, DIM, B, X, EL = ("\033[32m", "\033[92m", "\033[31m", "\033[33m", "\033[2m", "\033[1m",
+                                  "\033[0m", "\033[K")
+    spin, glyphs = "|/-\\", "0123456789abcdef#$%&*+=<>:"
     path = args.db or f"{STATE_DIR}/state.db"
     host = os.uname().nodename
+    scan_span = 50  # timer fires every 60 s, measured from the start of the previous ~10 s scan
+    state, known, loaded, frame, drops = None, {}, 0.0, 0, []
+    sys.stdout.write("\033[?25l\033[2J")
     try:
         while True:
-            known = load_devices(args.devices)
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
-            conn.row_factory = sqlite3.Row
-            devs = conn.execute("SELECT * FROM devices ORDER BY online DESC, ip").fetchall()
-            evs = conn.execute("SELECT * FROM events ORDER BY ts DESC, id DESC LIMIT ?", (args.events,)).fetchall()
-            armed = meta_get(conn, "armed", "0") == "1"
-            last = int(meta_get(conn, "last_scan", "0"))
-            conn.close()
-            unknown = [d for d in devs if d["mac"] not in known]
-            out = ["\033[H\033[2J", G, B,
-                   f" lan-watch :: {host} :: {time.strftime('%Y-%m-%d %H:%M:%S')} :: ",
-                   (G + "ARMED" if armed else Y + "NOT ARMED") + X + G,
-                   f" :: last scan {fmt_ts(last)[11:] if last else '-'}\n", X,
-                   G + " " + "=" * 96 + X + "\n",
-                   f" {B}{'STATE':8}{'ALIAS':22}{'IP':16}{'MAC':19}{'LAST SEEN':18}VENDOR{X}\n"]
-            for d in devs:
+            now = time.time()
+            if state is None or now - loaded >= args.refresh:
+                try:
+                    state, known = _read_state(path), load_devices(args.devices)
+                except sqlite3.Error:
+                    pass
+                loaded = now
+            if state is None:
+                time.sleep(1)
+                continue
+            devs, evs, armed, last = state
+            cols, rows = shutil.get_terminal_size((100, 30))
+            w = max(60, min(cols - 2, 118))
+            blink = frame % 2 == 0
+            lines = []
+
+            pulse = (BG + B + "*" if blink else DIM + "*") if armed else Y + "o"
+            lines.append(f" {BG}{B}LAN-WATCH{X}{G} :: {host} :: {time.strftime('%Y-%m-%d %H:%M:%S')} :: "
+                         f"{pulse} {'ARMED' if armed else 'NOT ARMED'}{X}")
+            barw = w - 30
+            since = now - last if last else scan_span + 1
+            if since <= scan_span:
+                filled = int(barw * since / scan_span)
+                bar, status = "#" * filled + "." * (barw - filled), f"next scan in {int(scan_span - since):2d}s"
+            else:
+                k = frame % barw
+                bar = "".join("#" if (i - k) % barw < 8 else "." for i in range(barw))
+                status = f"scanning {spin[frame % 4]}     "
+            lines.append(f" {G}[{bar}] {status}{X}")
+            load, mem, up = _sysinfo()
+            lines.append(f" {DIM}load {load:4.2f}   mem {mem.get('MemTotal', 0) - mem.get('MemAvailable', 0)}/"
+                         f"{mem.get('MemTotal', 0)} MiB   uptime {up // 3600}h{up % 3600 // 60:02d}m   "
+                         f"iface arp   frame {frame}{X}")
+            lines.append(G + " " + "=" * w + X)
+            lines.append(f" {B}  {'STATE':8}{'ALIAS':22}{'IP':16}{'MAC':19}{'SEEN':8}VENDOR{X}")
+            sweep = (frame // 2) % max(1, len(devs))
+            for i, d in enumerate(devs):
                 alias = known.get(d["mac"], {}).get("alias")
-                color = (R + B) if not alias else (G if d["online"] else DIM)
-                out.append(f" {color}{'online' if d['online'] else 'offline':8}{(alias or 'UNKNOWN')[:21]:22}"
-                           f"{d['ip'] or '-':16}{d['mac']:19}{fmt_ts(d['last_seen']):18}{(d['vendor'] or '-')[:24]}{X}\n")
-            out.append(G + " " + "=" * 96 + X + "\n")
-            out.append(f" {B}EVENTS{X}  {R + B if unknown else G}{len(unknown)} unknown{X}"
-                       f"  {G}{sum(1 for d in devs if d['online'])}/{len(devs)} online{X}\n")
-            for e in evs:
+                if not alias:
+                    color = R + B if blink else R
+                elif d["online"]:
+                    color = BG + B if i == sweep else G
+                else:
+                    color = DIM
+                mark = ">" if i == sweep else " "
+                lines.append(f" {color}{mark} {'online' if d['online'] else 'offline':8}{(alias or '!! UNKNOWN !!')[:21]:22}"
+                             f"{d['ip'] or '-':16}{d['mac']:19}{_ago(now - (d['last_seen'] or now)):8}"
+                             f"{(d['vendor'] or '-')[:max(0, w - 76)]}{X}")
+            lines.append(G + " " + "=" * w + X)
+            unknown = sum(1 for d in devs if d["mac"] not in known)
+            lines.append(f" {B}EVENTS{X}   {(R + B) if unknown else G}{unknown} unknown{X}   "
+                         f"{G}{sum(1 for d in devs if d['online'])}/{len(devs)} online{X}")
+            n_events = max(3, min(args.events, rows - len(lines) - 6))
+            for e in evs[:n_events]:
+                is_known = e["mac"] in known
                 who = known.get(e["mac"], {}).get("alias") or e["mac"] or e["detail"]
-                color = G if e["kind"] == "new" and e["mac"] in known else colors.get(e["kind"], "")
-                out.append(f" {DIM}{fmt_ts(e['ts'])}{X}  {color}{e['kind']:9}{X}{who[:40]:42}{e['ip'] or ''}\n")
-            sys.stdout.write("".join(out))
+                color = {"new": G if is_known else R + B, "conflict": R + B, "online": G, "offline": DIM}.get(e["kind"], "")
+                if now - e["ts"] < 120 and blink:
+                    color += B + "\033[7m"
+                lines.append(f" {DIM}{fmt_ts(e['ts'])}{X}  {color}{e['kind']:9}{X}{who[:40]:42}{e['ip'] or ''}")
+
+            rain_h = rows - len(lines) - 1
+            if rain_h > 1:
+                if len(drops) != w:
+                    drops = [random.randint(-rain_h * 4, rain_h) for _ in range(w)]
+                for r in range(rain_h):
+                    cells = []
+                    for c in range(w):
+                        dist = drops[c] - r
+                        if dist == 0:
+                            cells.append(BG + B + random.choice(glyphs) + X)
+                        elif 0 < dist < 7:
+                            cells.append((G if dist < 4 else DIM + G) + random.choice(glyphs) + X)
+                        else:
+                            cells.append(" ")
+                    lines.append(" " + "".join(cells))
+                drops = [p + 1 if p < rain_h + 7 else random.randint(-rain_h * 4, 0) for p in drops]
+
+            sys.stdout.write("\033[H" + "".join(line + EL + "\n" for line in lines[:rows - 1]) + "\033[J")
             sys.stdout.flush()
-            time.sleep(args.refresh)
+            frame += 1
+            time.sleep(1.0 / max(1, args.fps))
     except KeyboardInterrupt:
         return 0
+    finally:
+        sys.stdout.write(X + "\033[?25h\n")
+        sys.stdout.flush()
 
 
 def cmd_arm(args):
@@ -379,8 +470,9 @@ def main(argv=None):
     a.set_defaults(fn=cmd_arm)
     sub.add_parser("test-alert", help="send a test notification").set_defaults(fn=cmd_test_alert)
     d = sub.add_parser("dashboard", help="full-screen live view of devices and events")
-    d.add_argument("--refresh", type=int, default=5, help="seconds between redraws")
-    d.add_argument("--events", type=int, default=15, help="how many recent events to show")
+    d.add_argument("--fps", type=int, default=4, help="frames per second of the animation")
+    d.add_argument("--refresh", type=float, default=2, help="seconds between database reads")
+    d.add_argument("--events", type=int, default=10, help="max recent events to show")
     d.set_defaults(fn=cmd_dashboard)
     args = p.parse_args(argv)
     return args.fn(args)
