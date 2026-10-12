@@ -1,0 +1,8 @@
+# Autostart the live dashboard full screen on an Xfce desktop.
+# Copy to ~/.config/autostart/ of the user that logs in (it needs passwordless
+# `sudo -u lanwatch`, or membership in the lanwatch group plus read access to the DB).
+[Desktop Entry]
+Type=Application
+Name=lan-watch dashboard
+Exec=xfce4-terminal --disable-server --fullscreen --hide-menubar --hide-toolbar --hide-scrollbar --title=lan-watch --color-text=#33ff33 --color-bg=#000000 --font="Monospace 10" -x sudo -u lanwatch /usr/local/bin/lan-watch dashboard
+X-GNOME-Autostart-enabled=true

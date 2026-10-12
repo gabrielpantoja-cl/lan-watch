@@ -143,8 +143,13 @@ def meta_set(conn, key, value):
     conn.commit()
 
 
+ECHO = False  # set by `scan` so every event also lands in the journal
+
+
 def log_event(conn, ts, kind, mac="", ip="", detail=""):
     conn.execute("INSERT INTO events(ts,kind,mac,ip,detail) VALUES(?,?,?,?,?)", (ts, kind, mac, ip, detail))
+    if ECHO:
+        print(f"{kind} {mac} {ip} {detail}".strip())
 
 
 # --- notifications -------------------------------------------------------------
@@ -248,6 +253,8 @@ def process_scan(conn, seen, known, cfg, notifier, now=None) -> list[str]:
                           f"{known[row['mac']].get('alias', 'known device')} went offline.", 2, "")
             else:
                 conn.execute("UPDATE devices SET misses=? WHERE mac=?", (misses, row["mac"]))
+    conn.execute("INSERT INTO meta(key,value) VALUES('last_scan',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (str(now),))
     conn.commit()
     return produced
 
@@ -263,6 +270,8 @@ def prune(conn, cfg, now=None):
 # --- CLI -----------------------------------------------------------------------
 
 def cmd_scan(args):
+    global ECHO
+    ECHO = True
     cfg, known = load_config(args.config), load_devices(args.devices)
     conn = open_db(args.db)
     try:
@@ -300,6 +309,48 @@ def cmd_status(args):
     return 0
 
 
+def cmd_dashboard(args):
+    """Full-screen live view: devices and latest events, refreshed every few seconds."""
+    G, R, Y, DIM, B, X = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[1m", "\033[0m"
+    colors = {"new": R + B, "conflict": R + B, "online": G, "offline": DIM}
+    path = args.db or f"{STATE_DIR}/state.db"
+    host = os.uname().nodename
+    try:
+        while True:
+            known = load_devices(args.devices)
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+            conn.row_factory = sqlite3.Row
+            devs = conn.execute("SELECT * FROM devices ORDER BY online DESC, ip").fetchall()
+            evs = conn.execute("SELECT * FROM events ORDER BY ts DESC, id DESC LIMIT ?", (args.events,)).fetchall()
+            armed = meta_get(conn, "armed", "0") == "1"
+            last = int(meta_get(conn, "last_scan", "0"))
+            conn.close()
+            unknown = [d for d in devs if d["mac"] not in known]
+            out = ["\033[H\033[2J", G, B,
+                   f" lan-watch :: {host} :: {time.strftime('%Y-%m-%d %H:%M:%S')} :: ",
+                   (G + "ARMED" if armed else Y + "NOT ARMED") + X + G,
+                   f" :: last scan {fmt_ts(last)[11:] if last else '-'}\n", X,
+                   G + " " + "=" * 96 + X + "\n",
+                   f" {B}{'STATE':8}{'ALIAS':22}{'IP':16}{'MAC':19}{'LAST SEEN':18}VENDOR{X}\n"]
+            for d in devs:
+                alias = known.get(d["mac"], {}).get("alias")
+                color = (R + B) if not alias else (G if d["online"] else DIM)
+                out.append(f" {color}{'online' if d['online'] else 'offline':8}{(alias or 'UNKNOWN')[:21]:22}"
+                           f"{d['ip'] or '-':16}{d['mac']:19}{fmt_ts(d['last_seen']):18}{(d['vendor'] or '-')[:24]}{X}\n")
+            out.append(G + " " + "=" * 96 + X + "\n")
+            out.append(f" {B}EVENTS{X}  {R + B if unknown else G}{len(unknown)} unknown{X}"
+                       f"  {G}{sum(1 for d in devs if d['online'])}/{len(devs)} online{X}\n")
+            for e in evs:
+                who = known.get(e["mac"], {}).get("alias") or e["mac"] or e["detail"]
+                color = G if e["kind"] == "new" and e["mac"] in known else colors.get(e["kind"], "")
+                out.append(f" {DIM}{fmt_ts(e['ts'])}{X}  {color}{e['kind']:9}{X}{who[:40]:42}{e['ip'] or ''}\n")
+            sys.stdout.write("".join(out))
+            sys.stdout.flush()
+            time.sleep(args.refresh)
+    except KeyboardInterrupt:
+        return 0
+
+
 def cmd_arm(args):
     meta_set(open_db(args.db), "armed", "0" if args.off else "1")
     print("alerts disarmed" if args.off else "alerts armed")
@@ -327,6 +378,10 @@ def main(argv=None):
     a.add_argument("--off", action="store_true")
     a.set_defaults(fn=cmd_arm)
     sub.add_parser("test-alert", help="send a test notification").set_defaults(fn=cmd_test_alert)
+    d = sub.add_parser("dashboard", help="full-screen live view of devices and events")
+    d.add_argument("--refresh", type=int, default=5, help="seconds between redraws")
+    d.add_argument("--events", type=int, default=15, help="how many recent events to show")
+    d.set_defaults(fn=cmd_dashboard)
     args = p.parse_args(argv)
     return args.fn(args)
 
