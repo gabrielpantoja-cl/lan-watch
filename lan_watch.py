@@ -152,8 +152,10 @@ def local_network(cfg: dict):
         me = sock.getsockname()[0]
     if cfg["scan"]["network"]:
         return me, ipaddress.ip_network(cfg["scan"]["network"], strict=False)
+    # pythonw has no console, so without CREATE_NO_WINDOW each run flashes one for ipconfig
     out = subprocess.run(["ipconfig"], capture_output=True, text=True, errors="replace",
-                         timeout=30, check=False).stdout
+                         timeout=30, check=False,
+                         creationflags=subprocess.CREATE_NO_WINDOW).stdout
     net = ipaddress.ip_network(f"{me}/{parse_ipconfig_mask(out, me) or '255.255.255.0'}", strict=False)
     if net.num_addresses > 4096:
         raise RuntimeError(f"{net} is too large to probe; set [scan].network to a smaller range")
