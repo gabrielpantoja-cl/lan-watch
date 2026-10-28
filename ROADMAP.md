@@ -11,6 +11,7 @@ except for `CAP_NET_RAW`.
 - Hardened systemd service + timer, unprivileged `lanwatch` user.
 - Animated full-screen dashboard; events also written to the journal.
 - Voice alerts (`lan-watch voice`, systemd user service) with public-domain clips and quiet hours.
+- Windows 10/11 support: `SendARP` scanner (no admin, no Npcap), Task Scheduler installer, `winsound` voice, dashboard in Windows Terminal.
 
 ## Next
 

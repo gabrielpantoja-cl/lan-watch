@@ -41,6 +41,22 @@ class ParseTests(unittest.TestCase):
         self.assertIn(("192.0.2.51", "02:00:5e:10:00:51", ""), rows)
         self.assertIn(("192.0.2.24", "00:00:5e:00:53:24", "Example Laptops Ltd"), rows)
 
+    def test_ipconfig_mask_any_locale(self):
+        text = ("Wireless LAN adapter Wi-Fi:\n"
+                "   IPv4 Address. . . . . . . . . . . : 192.0.2.24(Preferred)\n"
+                "   Subnet Mask . . . . . . . . . . . : 255.255.252.0\n"
+                "Adaptador de Ethernet Ethernet 3:\n"
+                "   Direccion IPv4. . . . . . . . . . : 198.51.100.1\n"
+                "   Mascara de subred . . . . . . . . : 255.255.255.0\n")
+        self.assertEqual(lw.parse_ipconfig_mask(text, "192.0.2.24"), "255.255.252.0")
+        self.assertEqual(lw.parse_ipconfig_mask(text, "198.51.100.1"), "255.255.255.0")
+        self.assertIsNone(lw.parse_ipconfig_mask(text, "192.0.2.2"))
+
+    def test_oui_longest_prefix_and_random_macs(self):
+        oui = ["# comment\tignored\n", "00005E\tExample Corp\n", "00005E0053\tExample Sub Ltd\n"]
+        got = lw.oui_vendors(oui, {"00:00:5e:00:53:01", "00:00:5e:10:00:01", "02:00:5e:00:53:01"})
+        self.assertEqual(got, {"00:00:5e:00:53:01": "Example Sub Ltd", "00:00:5e:10:00:01": "Example Corp"})
+
     def test_random_mac(self):
         self.assertTrue(lw.is_random_mac("02:00:5e:10:00:51"))
         self.assertFalse(lw.is_random_mac("00:00:5e:00:53:01"))

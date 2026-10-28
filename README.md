@@ -2,7 +2,7 @@
 
 **A tiny, dependency-free watcher that tells you when an unknown device joins your home network.**
 
-It runs `arp-scan` once a minute, compares what answers against a list of devices you trust, and sends a push notification through [ntfy](https://ntfy.sh) when something new shows up. Pure Python standard library, one file, SQLite for state. It is built to run on very old hardware (it was written for a 2010 netbook with 1 GB of RAM).
+It ARP-scans your LAN once a minute (`arp-scan` on Linux, the built-in `SendARP` API on Windows), compares what answers against a list of devices you trust, and sends a push notification through [ntfy](https://ntfy.sh) when something new shows up. Pure Python standard library, one file, SQLite for state. It runs on Linux and Windows 10/11, and is built to run on very old hardware (it was written for a 2010 netbook with 1 GB of RAM).
 
 ## Why not NetAlertX / WatchYourLAN / Fing?
 
@@ -15,7 +15,8 @@ NetAlertX wants Docker and more RAM than a netbook has, WatchYourLAN has had no 
 - **Hysteresis**: a device is only "offline" after N consecutive missed scans, because phones and cameras sleep and miss ARP requests.
 - **Arm/disarm**: scans only record until you run `lan-watch arm`, so the first run does not flood you with alerts.
 - **Privacy by default**: alerts about known devices are off (who is home is sensitive), and notifications carry only the vendor, IP and the last three MAC octets, never a person's name.
-- Runs as an unprivileged `lanwatch` user holding only `CAP_NET_RAW`, under a hardened systemd unit.
+- Linux: runs as an unprivileged `lanwatch` user holding only `CAP_NET_RAW`, under a hardened systemd unit.
+- Windows: runs as your own user from Task Scheduler; no admin rights, no drivers (no Npcap), nothing to install but Python.
 
 ## What it cannot do
 
@@ -23,6 +24,7 @@ NetAlertX wants Docker and more RAM than a netbook has, WatchYourLAN has had no 
 - It cannot see failed connection attempts; only your router can.
 - Phones with a "private Wi-Fi address" appear as new devices if the setting changes.
 - An attacker who clones the MAC of a trusted device is invisible to MAC allow-listing.
+- On Windows it watches only while you are logged in, and `SendARP` may answer from the OS ARP cache, so a device that leaves is noticed a little later (the offline hysteresis absorbs it).
 
 ## Install (Debian/Ubuntu, Python >= 3.11)
 
@@ -37,6 +39,21 @@ sudo cat /etc/lan-watch/ntfy-topic           # subscribe your phone to this topi
 sudo -u lanwatch lan-watch test-alert
 sudo -u lanwatch lan-watch arm
 ```
+
+## Install (Windows 10/11, Python >= 3.11)
+
+From PowerShell in the repo directory (no admin needed):
+
+```powershell
+.\install.ps1 -Dashboard                       # add -Voice to speak alerts out loud
+notepad $env:LOCALAPPDATA\lan-watch\devices.toml   # add your devices (see examples/)
+lan-watch list                                 # in a new terminal; see what answered
+Get-Content $env:LOCALAPPDATA\lan-watch\ntfy-topic  # subscribe your phone to this topic
+lan-watch test-alert
+lan-watch arm
+```
+
+It copies the program to `%LOCALAPPDATA%\Programs\lan-watch` (added to your `PATH`), keeps config and state in `%LOCALAPPDATA%\lan-watch`, downloads the vendor database `ieee-oui.txt`, and registers the task `lan-watch scan` (every minute, also on battery). The scan probes the subnet of the interface that holds the default route; set `[scan].network` to change it. `-Dashboard` opens the live view in a Windows Terminal window at logon; add `-Position "x,y"` to open it maximized on the monitor holding that point, or `-Fullscreen`. `.\install.ps1 -Uninstall` removes it all but your config and state.
 
 The ntfy topic is generated randomly; treat it like a password. For stronger privacy, self-host ntfy and change `[ntfy].server`.
 
@@ -54,7 +71,7 @@ The ntfy topic is generated randomly; treat it like a password. For stronger pri
 
 ## Managing known devices
 
-`/etc/lan-watch/devices.toml` is the allow-list: any MAC not listed there is "unknown" and triggers an alert. It is re-read on every scan, so no restart is needed (the dashboard picks changes up within seconds). Keep your real file out of public repositories; a good pattern is a private repo as the source of truth plus a small deploy script that copies it to the host.
+`/etc/lan-watch/devices.toml` (Windows: `%LOCALAPPDATA%\lan-watch\devices.toml`) is the allow-list: any MAC not listed there is "unknown" and triggers an alert. It is re-read on every scan, so no restart is needed (the dashboard picks changes up within seconds). Keep your real file out of public repositories; a good pattern is a private repo as the source of truth plus a small deploy script that copies it to the host.
 
 **Add a device**
 
@@ -76,13 +93,13 @@ The ntfy topic is generated randomly; treat it like a password. For stronger pri
 
 ## Voice alerts
 
-`lan-watch voice` runs inside the desktop session (as a systemd user service, see `systemd/lan-watch-voice.service`), watches the event log and plays a voice clip for every alert: "a new, unknown device has just connected to your network" or "two devices are claiming the same address". The clips in `sounds/` were made offline with Piper and a public-domain voice; replace them with any WAV you like. Set `[sound].quiet_hours = "23:00-07:00"` to keep the house quiet at night (push notifications still arrive). Try it with `lan-watch voice --test unknown`.
+`lan-watch voice` runs inside the desktop session (as a systemd user service, see `systemd/lan-watch-voice.service`), watches the event log and plays a voice clip for every alert: "a new, unknown device has just connected to your network" or "two devices are claiming the same address". The clips in `sounds/` were made offline with Piper and a public-domain voice; replace them with any WAV you like. Set `[sound].quiet_hours = "23:00-07:00"` to keep the house quiet at night (push notifications still arrive). Try it with `lan-watch voice --test unknown`. On Windows it plays through Python's built-in `winsound` (`install.ps1 -Voice` starts it at logon).
 
 ## Live dashboard
 
-`lan-watch dashboard` is an animated green-on-black view (4 fps by default, `--fps` to change): a live clock, a countdown bar to the next scan, a radar sweep over the device list with time since each device was last seen, and the event log filling the rest of the screen (fresh events blink, unknown devices in red). It reads the database read-only and costs about 3 % CPU on an Atom N450 (the terminal itself takes ~10 %). To have it open full screen whenever the desktop starts, copy `examples/lan-watch-dashboard.desktop` to `~/.config/autostart/` (Xfce). Keep in mind that anyone who can see that screen sees who is home.
+`lan-watch dashboard` is an animated green-on-black view (4 fps by default, `--fps` to change): a live clock, a countdown bar to the next scan, a radar sweep over the device list with time since each device was last seen, and the event log filling the rest of the screen (fresh events blink, unknown devices in red). It reads the database read-only and costs about 3 % CPU on an Atom N450 (the terminal itself takes ~10 %). To have it open full screen whenever the desktop starts, copy `examples/lan-watch-dashboard.desktop` to `~/.config/autostart/` (Xfce); on Windows use `install.ps1 -Dashboard`. Keep in mind that anyone who can see that screen sees who is home.
 
-Every event is also written to the journal: `journalctl -u lan-watch.service -f`.
+On Linux every event is also written to the journal: `journalctl -u lan-watch.service -f`.
 
 ## Tests
 

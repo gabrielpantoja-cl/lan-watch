@@ -1,7 +1,9 @@
-# Copy to /etc/lan-watch/config.toml. Every key is optional (defaults in lan_watch.py).
+# Copy to /etc/lan-watch/config.toml (Windows: %LOCALAPPDATA%\lan-watch\config.toml; install.ps1 does it).
+# Every key is optional (defaults in lan_watch.py).
 
 [scan]
-interface = "eth0"          # the interface connected to the LAN you want to watch
+interface = "eth0"          # Linux: the interface connected to the LAN you want to watch
+# network = "192.168.1.0/24"  # Windows: range to probe (default: subnet of the default route)
 
 [detect]
 offline_after_misses = 10   # scans without answer before a device counts as offline
@@ -9,7 +11,7 @@ alert_cooldown_seconds = 21600
 
 [ntfy]
 server = "https://ntfy.sh"  # or your own self-hosted ntfy
-topic_file = "/etc/lan-watch/ntfy-topic"
+# topic_file = "/etc/lan-watch/ntfy-topic"  # default: ntfy-topic next to this file
 
 [alerts]
 unknown_device = true

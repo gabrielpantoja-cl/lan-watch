@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""lan-watch: detect unknown devices on your LAN with arp-scan and alert through ntfy.
+"""lan-watch: detect unknown devices on your LAN with ARP and alert through ntfy.
 
-Standard library only (Python >= 3.11). Meant to run every minute from a systemd
-timer as an unprivileged user holding CAP_NET_RAW. State lives in SQLite.
+Standard library only (Python >= 3.11). On Linux it runs every minute from a systemd
+timer as an unprivileged user holding CAP_NET_RAW and scans with arp-scan. On Windows
+it runs every minute from Task Scheduler as the desktop user and asks the OS to ARP
+each address (iphlpapi SendARP, no admin rights needed). State lives in SQLite.
 """
 from __future__ import annotations
 
@@ -17,15 +19,24 @@ import tomllib
 import urllib.error
 import urllib.request
 
-CONFIG_DIR = os.environ.get("LAN_WATCH_CONFIG_DIR", "/etc/lan-watch")
-STATE_DIR = os.environ.get("LAN_WATCH_STATE_DIR", "/var/lib/lan-watch")
+IS_WINDOWS = os.name == "nt"
+# Windows has no service user here: config and state live in the desktop user's profile.
+_WIN_HOME = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "lan-watch")
+CONFIG_DIR = os.environ.get("LAN_WATCH_CONFIG_DIR", _WIN_HOME if IS_WINDOWS else "/etc/lan-watch")
+STATE_DIR = os.environ.get("LAN_WATCH_STATE_DIR", _WIN_HOME if IS_WINDOWS else "/var/lib/lan-watch")
+_SOUNDS = (os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds") if IS_WINDOWS
+           else "/usr/local/share/lan-watch/sounds")
 
 DEFAULTS = {
     "scan": {
         "interface": "eth0",
         "retries": 3,
-        "ouifile": "/usr/share/arp-scan/ieee-oui.txt",
+        "ouifile": f"{CONFIG_DIR}/ieee-oui.txt" if IS_WINDOWS else "/usr/share/arp-scan/ieee-oui.txt",
         "arp_scan": "/usr/sbin/arp-scan",
+        # Windows only: CIDR to scan ("" = the subnet of the interface holding the default
+        # route) and parallel probes. An unanswered SendARP blocks ~3 s, so a /22 needs many.
+        "network": "",
+        "workers": 256,
     },
     "detect": {
         # Scans without an answer before a device is considered offline. Phones and
@@ -48,9 +59,9 @@ DEFAULTS = {
     "sound": {
         # Played by `lan-watch voice`, which runs inside the desktop session (it needs the
         # session's audio server). Empty path = no sound for that alert.
-        "player": "paplay",
-        "unknown": "/usr/local/share/lan-watch/sounds/unknown.wav",
-        "conflict": "/usr/local/share/lan-watch/sounds/conflict.wav",
+        "player": "winsound" if IS_WINDOWS else "paplay",  # winsound: Python's built-in player
+        "unknown": os.path.join(_SOUNDS, "unknown.wav"),
+        "conflict": os.path.join(_SOUNDS, "conflict.wav"),
         "quiet_hours": "",  # e.g. "23:00-07:00": stay silent (ntfy still notifies)
     },
 }
@@ -118,6 +129,83 @@ def run_arp_scan(cfg: dict) -> list[tuple[str, str, str]]:
     if res.returncode != 0:
         raise RuntimeError(f"arp-scan failed ({res.returncode}): {res.stderr.strip()[:300]}")
     return parse_arp_scan(res.stdout)
+
+
+def parse_ipconfig_mask(text: str, ip: str) -> str | None:
+    """Subnet mask that `ipconfig` prints after the line holding `ip` (labels are localized)."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if re.search(rf"[:\s]{re.escape(ip)}(\(\S+\))?\s*$", line):
+            for nxt in lines[i + 1:i + 4]:
+                m = re.search(r":\s*(255\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*$", nxt)
+                if m:
+                    return m.group(1)
+    return None
+
+
+def local_network(cfg: dict):
+    """(own IP, network to scan) on Windows."""
+    import ipaddress
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect(("192.0.2.1", 9))  # UDP connect sends nothing; it only picks the route
+        me = sock.getsockname()[0]
+    if cfg["scan"]["network"]:
+        return me, ipaddress.ip_network(cfg["scan"]["network"], strict=False)
+    out = subprocess.run(["ipconfig"], capture_output=True, text=True, errors="replace",
+                         timeout=30, check=False).stdout
+    net = ipaddress.ip_network(f"{me}/{parse_ipconfig_mask(out, me) or '255.255.255.0'}", strict=False)
+    if net.num_addresses > 4096:
+        raise RuntimeError(f"{net} is too large to probe; set [scan].network to a smaller range")
+    return me, net
+
+
+def oui_vendors(lines, macs) -> dict[str, str]:
+    """{mac: vendor} by longest prefix match against arp-scan's ieee-oui.txt format."""
+    want = {mac: mac.replace(":", "").upper() for mac in macs if not is_random_mac(mac)}
+    best: dict[str, tuple[int, str]] = {}
+    for line in lines:
+        prefix, _, vendor = line.rstrip("\n").partition("\t")
+        if not vendor or line.startswith("#"):
+            continue
+        prefix = prefix.upper()
+        for mac, hexmac in want.items():
+            if hexmac.startswith(prefix) and len(prefix) > best.get(mac, (0, ""))[0]:
+                best[mac] = (len(prefix), vendor.strip())
+    return {mac: vendor for mac, (_, vendor) in best.items()}
+
+
+def run_sendarp(cfg: dict) -> list[tuple[str, str, str]]:
+    """Windows scan: one SendARP per address, in parallel. Answers may come from the ARP
+    cache, which Windows expires within ~15-45 s, well inside the offline hysteresis."""
+    import ctypes
+    import socket
+    import struct
+    from concurrent.futures import ThreadPoolExecutor
+    me, net = local_network(cfg)
+    send_arp = ctypes.windll.iphlpapi.SendARP
+    send_arp.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+
+    def probe(ip):
+        buf, size = ctypes.create_string_buffer(8), ctypes.c_ulong(8)
+        dest = struct.unpack("<I", socket.inet_aton(ip))[0]
+        if send_arp(dest, 0, buf, ctypes.byref(size)) == 0 and size.value == 6:
+            return ip, normalize_mac(buf.raw[:6].hex(":"))
+        return None
+
+    # Our own address answers from the local adapter; arp-scan never lists itself either.
+    targets = [str(h) for h in net.hosts() if str(h) != me]
+    with ThreadPoolExecutor(max_workers=max(1, int(cfg["scan"]["workers"]))) as pool:
+        found = [r for r in pool.map(probe, targets) if r]
+    vendors = {}
+    if found and os.path.exists(cfg["scan"]["ouifile"]):
+        with open(cfg["scan"]["ouifile"], encoding="utf-8", errors="replace") as fh:
+            vendors = oui_vendors(fh, {mac for _, mac in found})
+    return [(ip, mac, vendors.get(mac, "")) for ip, mac in found]
+
+
+def run_scan(cfg: dict) -> list[tuple[str, str, str]]:
+    return run_sendarp(cfg) if IS_WINDOWS else run_arp_scan(cfg)
 
 
 # --- state ---------------------------------------------------------------------
@@ -288,8 +376,8 @@ def cmd_scan(args):
     cfg, known = load_config(args.config), load_devices(args.devices)
     conn = open_db(args.db)
     try:
-        seen = run_arp_scan(cfg)
-    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        seen = run_scan(cfg)
+    except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
         print(f"lan-watch: {exc}", file=sys.stderr)
         return 1
     process_scan(conn, seen, known, cfg, Notifier(cfg, dry_run=args.dry_run))
@@ -333,7 +421,34 @@ def _read_state(path):
         conn.close()
 
 
+def _sysinfo_windows():
+    import ctypes
+
+    class MemStatus(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + \
+                   [(n, ctypes.c_ulonglong) for n in ("total", "avail", "tpage", "apage", "tvirt", "avirt", "aext")]
+
+    k32 = ctypes.windll.kernel32
+    st = MemStatus()
+    st.dwLength = ctypes.sizeof(st)
+    k32.GlobalMemoryStatusEx(ctypes.byref(st))
+    k32.GetTickCount64.restype = ctypes.c_ulonglong
+    return None, {"MemTotal": st.total >> 20, "MemAvailable": st.avail >> 20}, k32.GetTickCount64() // 1000
+
+
+def _enable_ansi():
+    """Old Windows consoles interpret escape codes only after opting in (Windows Terminal always does)."""
+    if IS_WINDOWS:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        handle, mode = k32.GetStdHandle(-11), ctypes.c_ulong()
+        if k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            k32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+
 def _sysinfo():
+    if IS_WINDOWS:
+        return _sysinfo_windows()
     mem = {}
     with open("/proc/meminfo") as fh:
         for line in fh:
@@ -354,14 +469,16 @@ def _ago(seconds):
 
 def cmd_dashboard(args):
     """Full-screen animated live view: devices, scan countdown, and as many recent events as fit."""
+    import platform
     import shutil
     G, BG, R, Y, DIM, B, X, EL = ("\033[32m", "\033[92m", "\033[31m", "\033[33m", "\033[2m", "\033[1m",
                                   "\033[0m", "\033[K")
     spin = "|/-\\"
     path = args.db or f"{STATE_DIR}/state.db"
-    host = os.uname().nodename
+    host = platform.node()
     scan_span = 50  # timer fires every 60 s, measured from the start of the previous ~10 s scan
     state, known, loaded, frame = None, {}, 0.0, 0
+    _enable_ansi()
     sys.stdout.write("\033[?25l\033[2J")
     try:
         while True:
@@ -371,6 +488,7 @@ def cmd_dashboard(args):
                     state, known = _read_state(path), load_devices(args.devices)
                 except sqlite3.Error:
                     pass
+                load, mem, up = _sysinfo()
                 loaded = now
             if state is None:
                 time.sleep(1)
@@ -394,8 +512,7 @@ def cmd_dashboard(args):
                 bar = "".join("#" if (i - k) % barw < 8 else "." for i in range(barw))
                 status = f"scanning {spin[frame % 4]}     "
             lines.append(f" {G}[{bar}] {status}{X}")
-            load, mem, up = _sysinfo()
-            lines.append(f" {DIM}load {load:4.2f}   mem {mem.get('MemTotal', 0) - mem.get('MemAvailable', 0)}/"
+            lines.append(f" {DIM}load {'  - ' if load is None else f'{load:4.2f}'}   mem {mem.get('MemTotal', 0) - mem.get('MemAvailable', 0)}/"
                          f"{mem.get('MemTotal', 0)} MiB   uptime {up // 3600}h{up % 3600 // 60:02d}m   "
                          f"iface arp   frame {frame}{X}")
             lines.append(G + " " + "=" * w + X)
@@ -460,7 +577,11 @@ def cmd_voice(args):
         if not os.path.exists(path):
             print(f"lan-watch voice: no sound for '{kind}' ({path or 'not set'})", file=sys.stderr)
             return
-        subprocess.run([snd["player"], path], timeout=60, check=False)
+        if snd["player"] == "winsound":
+            import winsound
+            winsound.PlaySound(path, winsound.SND_FILENAME)
+        else:
+            subprocess.run([snd["player"], path], timeout=60, check=False)
 
     if args.test:
         play(args.test)

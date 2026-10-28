@@ -4,7 +4,7 @@ Instructions for AI coding agents working in this repository.
 
 ## Project
 
-`lan-watch` is a tiny watcher that alerts when an unknown device joins a home LAN. It runs `arp-scan` once a minute (systemd timer), compares results against a trusted device list, keeps state in SQLite, and sends push notifications through ntfy.
+`lan-watch` is a tiny watcher that alerts when an unknown device joins a home LAN. It ARP-scans once a minute, compares results against a trusted device list, keeps state in SQLite, and sends push notifications through ntfy. It runs on Linux (`arp-scan`, systemd timer) and Windows 10/11 (`SendARP` from `iphlpapi` through `ctypes`, Task Scheduler).
 
 ## Layout
 
@@ -13,6 +13,7 @@ Instructions for AI coding agents working in this repository.
 - `examples/` — example `config.toml` and `devices.toml`.
 - `systemd/` — hardened `lan-watch.service` and `lan-watch.timer`.
 - `install.sh` — Debian/Ubuntu installer (run as root).
+- `install.ps1` — Windows installer (current user, no admin).
 
 ## Commands
 
@@ -21,13 +22,14 @@ Instructions for AI coding agents working in this repository.
 - Syntax check shell: `bash -n install.sh`
 - Validate the unit: `systemd-analyze verify systemd/lan-watch.service`
 
-Requires Python >= 3.11 (`tomllib`). Runtime needs `arp-scan` and raw-socket privileges; tests must not.
+Requires Python >= 3.11 (`tomllib`). On Linux the runtime needs `arp-scan` and raw-socket privileges; on Windows nothing beyond Python. Tests need neither and must pass on both.
 
 ## Hard constraints
 
 - **Standard library only.** No third-party dependencies, no `requirements.txt`, no `pip install`. This is a core design goal.
 - **Single file.** Keep the application in `lan_watch.py`; do not split into a package without being asked.
-- **Low-resource target.** It must run on very old hardware (1 GB RAM netbook). Avoid heavy imports, background threads, and large in-memory structures.
+- **Low-resource target.** It must run on very old hardware (1 GB RAM netbook). Avoid heavy imports, background threads, and large in-memory structures. Platform-specific modules (`ctypes`, `winsound`, `concurrent.futures`) are imported inside the Windows code paths only, so the Linux path stays as light as before.
+- **Cross-platform.** Branch on `IS_WINDOWS` at the edges (paths, scanner, sound player, dashboard system info); `process_scan` and the state must stay identical on both systems.
 - **Privacy by default.** Notifications may contain only vendor, IP and the last three MAC octets. Never put person names or full MACs in alerts. Alerts about known devices stay off by default.
 - **Security posture.** The service runs as unprivileged `lanwatch` with only `CAP_NET_RAW`. Do not widen systemd capabilities, address families, or filesystem access without a concrete reason, and explain it in the commit message.
 - **Never commit secrets or real network data**: ntfy topics, real MAC addresses, `devices.toml`, `config.toml`, or SQLite databases. Examples must use fake values.
