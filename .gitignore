@@ -1,3 +1,19 @@
 AGENTS.local.md
 CLAUDE.local.md
 __pycache__/
+
+# Real network data and secrets: these live in /etc, /var/lib or %LOCALAPPDATA%,
+# ignored here in case one is ever copied into the repo by mistake.
+devices.toml
+config.toml
+ntfy-topic
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+.env
+
+# Downloaded vendor database
+ieee-oui.txt
